@@ -1,0 +1,239 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum MemberRole {
+  OWNER
+  MEMBER
+}
+
+enum ConnectionStatus {
+  CONNECTED
+  REAUTH_REQUIRED
+  DISCONNECTED
+}
+
+// Normalized status. The original TikTok value is always kept in externalStatus.
+enum EntityStatus {
+  ACTIVE
+  PAUSED
+  PENDING
+  UNDER_REVIEW
+  REJECTED
+  DISABLED
+  UNKNOWN
+}
+
+enum OperationStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  VERIFICATION_FAILED
+}
+
+model User {
+  id           String       @id @default(cuid())
+  email        String       @unique
+  name         String
+  passwordHash String
+  createdAt    DateTime     @default(now())
+  memberships  Membership[]
+}
+
+model Workspace {
+  id          String            @id @default(cuid())
+  name        String
+  createdAt   DateTime          @default(now())
+  memberships Membership[]
+  connection  TikTokConnection?
+}
+
+model Membership {
+  userId      String
+  workspaceId String
+  role        MemberRole @default(MEMBER)
+  createdAt   DateTime   @default(now())
+  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace   Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@id([userId, workspaceId])
+}
+
+// One OAuth client registration per redirect URI (i.e. per deployment domain).
+model TikTokClientRegistration {
+  redirectUri   String   @id
+  clientInfoEnc String
+  createdAt     DateTime @default(now())
+}
+
+// One TikTok authorization per workspace, shared by its members. Tokens are encrypted.
+model TikTokConnection {
+  id                String           @id @default(cuid())
+  workspaceId       String           @unique
+  status            ConnectionStatus @default(DISCONNECTED)
+  tokensEnc         String?
+  redirectUri       String?
+  externalUserId    String?
+  displayName       String?
+  connectedByUserId String?
+  lastError         String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  workspace         Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+}
+
+// Short-lived state for an in-progress sign-in (state + PKCE verifier).
+model OAuthState {
+  state        String   @id
+  workspaceId  String
+  userId       String
+  codeVerifier String?
+  redirectUri  String
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
+}
+
+model BusinessCenter {
+  id           String      @id @default(cuid())
+  workspaceId  String
+  externalBcId String
+  name         String
+  externalType String?
+  status       String?
+  userRole     String?
+  raw          Json
+  lastSyncedAt DateTime
+  adAccounts   AdAccount[]
+
+  @@unique([workspaceId, externalBcId])
+}
+
+model AdAccount {
+  id                   String          @id @default(cuid())
+  workspaceId          String
+  businessCenterId     String?
+  externalAdvertiserId String
+  name                 String
+  currency             String?
+  timezone             String?
+  status               String?
+  raw                  Json
+  lastSyncedAt         DateTime
+  businessCenter       BusinessCenter? @relation(fields: [businessCenterId], references: [id], onDelete: SetNull)
+  campaigns            Campaign[]
+
+  @@unique([workspaceId, externalAdvertiserId])
+}
+
+model Campaign {
+  id                 String       @id @default(cuid())
+  workspaceId        String
+  adAccountId        String
+  externalCampaignId String
+  name               String
+  objective          String?
+  status             EntityStatus @default(UNKNOWN)
+  externalStatus     String?
+  operationStatus    String?
+  budgetMode         String?
+  budgetAmount       Decimal?     @db.Decimal(18, 2)
+  budgetOptimizeOn   Boolean?
+  externalCreatedAt  String?
+  externalUpdatedAt  String?
+  raw                Json
+  lastSyncedAt       DateTime
+  adAccount          AdAccount    @relation(fields: [adAccountId], references: [id], onDelete: Cascade)
+  adGroups           AdGroup[]
+
+  @@unique([adAccountId, externalCampaignId])
+  @@index([workspaceId])
+}
+
+model AdGroup {
+  id                String       @id @default(cuid())
+  campaignId        String
+  externalAdGroupId String
+  name              String
+  status            EntityStatus @default(UNKNOWN)
+  externalStatus    String?
+  operationStatus   String?
+  budgetMode        String?
+  budgetAmount      Decimal?     @db.Decimal(18, 2)
+  bidStrategy       String?
+  optimizationGoal  String?
+  targeting         Json?
+  raw               Json
+  lastSyncedAt      DateTime
+  campaign          Campaign     @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  ads               Ad[]
+
+  @@unique([campaignId, externalAdGroupId])
+}
+
+model Ad {
+  id              String       @id @default(cuid())
+  adGroupId       String
+  externalAdId    String
+  name            String
+  status          EntityStatus @default(UNKNOWN)
+  externalStatus  String?
+  operationStatus String?
+  adFormat        String?
+  adText          String?
+  callToAction    String?
+  landingPageUrl  String?
+  raw             Json
+  lastSyncedAt    DateTime
+  adGroup         AdGroup      @relation(fields: [adGroupId], references: [id], onDelete: Cascade)
+
+  @@unique([adGroupId, externalAdId])
+}
+
+// Every write to TikTok is recorded as an operation before it runs.
+model TikTokOperation {
+  id             String          @id @default(cuid())
+  workspaceId    String
+  userId         String
+  advertiserId   String?
+  resourceType   String
+  resourceId     String?
+  action         String
+  requestedData  Json
+  status         OperationStatus @default(QUEUED)
+  error          String?
+  technicalError String?
+  createdAt      DateTime        @default(now())
+  startedAt      DateTime?
+  completedAt    DateTime?
+
+  @@index([workspaceId, createdAt])
+}
+
+model ActivityLog {
+  id           String   @id @default(cuid())
+  workspaceId  String
+  userId       String
+  userName     String
+  operationId  String?
+  action       String
+  resourceType String
+  resourceId   String?
+  resourceName String?
+  advertiserId String?
+  before       Json?
+  after        Json?
+  result       String
+  message      String?
+  createdAt    DateTime @default(now())
+
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, resourceId])
+}
