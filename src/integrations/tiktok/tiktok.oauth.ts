@@ -9,6 +9,7 @@ import { decryptJson, encryptJson } from "@/lib/crypto";
 import { prisma } from "@/lib/db";
 import { env } from "@/lib/env";
 import { TikTokError } from "./tiktok.errors";
+import { boundedFetch, OAUTH_LIMITS, timed, type OAuthLimits } from "./tiktok.http";
 
 const STATE_TTL_MS = 10 * 60 * 1000;
 
@@ -146,10 +147,18 @@ export async function markReauthRequired(workspaceId: string, reason: string): P
 }
 
 /** Step 1 of "Connect TikTok": returns the TikTok page the browser must be sent to. */
-export async function startAuthorization(workspaceId: string, userId: string): Promise<URL> {
-  await prisma.oAuthState.deleteMany({ where: { expiresAt: { lt: new Date() } } });
+export async function startAuthorization(
+  workspaceId: string,
+  userId: string,
+  limits: OAuthLimits = OAUTH_LIMITS,
+): Promise<URL> {
+  await timed("start: clear expired states", () =>
+    prisma.oAuthState.deleteMany({ where: { expiresAt: { lt: new Date() } } }),
+  );
   const provider = new DbOAuthProvider({ workspaceId, userId, interactive: true, ignoreTokens: true });
-  const result = await auth(provider, { serverUrl: env.tiktokMcpUrl });
+  const result = await timed("start: discovery, registration, authorization URL", () =>
+    auth(provider, { serverUrl: env.tiktokMcpUrl, fetchFn: boundedFetch(limits) }),
+  );
   if (result !== "REDIRECT" || !provider.authorizationUrl) {
     throw new Error("TikTok did not return an authorization page");
   }
@@ -157,8 +166,12 @@ export async function startAuthorization(workspaceId: string, userId: string): P
 }
 
 /** Step 2: the callback. Exchanges the code for tokens and stores them encrypted. */
-export async function completeAuthorization(state: string, code: string): Promise<{ workspaceId: string }> {
-  const row = await prisma.oAuthState.findUnique({ where: { state } });
+export async function completeAuthorization(
+  state: string,
+  code: string,
+  limits: OAuthLimits = OAUTH_LIMITS,
+): Promise<{ workspaceId: string }> {
+  const row = await timed("callback: load state", () => prisma.oAuthState.findUnique({ where: { state } }));
   if (!row || row.expiresAt < new Date()) {
     throw new Error("This TikTok sign-in link has expired. Start the connection again.");
   }
@@ -170,7 +183,9 @@ export async function completeAuthorization(state: string, code: string): Promis
     ignoreTokens: true,
   });
   try {
-    const result = await auth(provider, { serverUrl: env.tiktokMcpUrl, authorizationCode: code });
+    const result = await timed("callback: discovery and token exchange", () =>
+      auth(provider, { serverUrl: env.tiktokMcpUrl, authorizationCode: code, fetchFn: boundedFetch(limits) }),
+    );
     if (result !== "AUTHORIZED") throw new Error("TikTok did not complete the authorization");
   } finally {
     await prisma.oAuthState.deleteMany({ where: { state } });
